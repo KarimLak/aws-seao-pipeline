@@ -1,0 +1,95 @@
+{
+  "Comment": "Daily SEAO ELT pipeline: idempotency check → Lambda extract → Glue crawler (poll) → Athena transform → mark complete.",
+  "QueryLanguage": "JSONata",
+  "StartAt": "Init",
+  "States": {
+    "Init": {
+      "Type": "Pass",
+      "Comment": "Derive YYYY-MM-DD from the execution start time. $processDate is available in every downstream state.",
+      "Assign": {
+        "processDate": "{% $substring($states.context.Execution.StartTime, 0, 10) %}"
+      },
+      "Next": "ExtractSEAO"
+    },
+    "ExtractSEAO": {
+      "Type": "Task",
+      "Comment": "Invoke seao-extract Lambda. Writes one JSON file per contract to S3 raw/dt=YYYY-MM-DD/.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "seao-extract",
+        "Payload": {
+          "process_date": "{% $processDate %}"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "StartCrawler"
+    },
+    "StartCrawler": {
+      "Type": "Task",
+      "Comment": "Kick off the Glue crawler. If it's already running, jump straight to the polling loop.",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+      "Arguments": {
+        "Name": "seao-raw-crawler"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "Glue.CrawlerRunningException"
+          ],
+          "Next": "WaitForCrawler"
+        }
+      ],
+      "Next": "WaitForCrawler"
+    },
+    "WaitForCrawler": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "GetCrawlerStatus"
+    },
+    "GetCrawlerStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+      "Arguments": {
+        "Name": "seao-raw-crawler"
+      },
+      "Next": "CrawlerDone"
+    },
+    "CrawlerDone": {
+      "Type": "Choice",
+      "Comment": "Glue crawlers have no .sync integration; poll every 30s until State = READY.",
+      "Choices": [
+        {
+          "Condition": "{% $states.input.Crawler.State = 'READY' %}",
+          "Next": "RunTransform"
+        }
+      ],
+      "Default": "WaitForCrawler"
+    },
+    "RunTransform": {
+      "Type": "Task",
+      "Comment": "Athena INSERT that flattens raw JSON → seao.contracts. .sync waits for the query to finish. The date is injected via JSONata string concat at WHERE dt = '...'.",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Arguments": {
+        "QueryString": "{% \"INSERT INTO seao.contracts SELECT CAST(NULL AS varchar), CAST(contract.avisResumeInformation.id AS varchar), contract.avisResumeInformation.typeAvis.descriptionFr, 'Publié', concat('https://seao.gouv.qc.ca/avis-resultat-recherche/consulter?ItemId=', uuid), contract.avisResumeInformation.titre, contract.avisResumeInformationDO.nomOrganisation, contract.avisResumeInformation.natureContrat.descriptionFr, contract.avisResumeCategorieUnspsc.categorie.descriptionFr, contract.avisResumeDescription.descriptionHtml, array_join(transform(contract.avisResumeCategorieUnspsc.unspsc, u -> u.descriptionFr), '; '), json_format(CAST(contract.avisResumeDocuments.documents AS json)), array_join(transform(contract.avisResumeInformation.regionsLivraison, r -> r.descriptionFr), '; '), array_join(transform(contract.avisResumeInformation.accordMarchesPublics, a -> a.descriptionFr), '; '), contract.avisResumeInformation.territoireVise.descriptionFr, contract.avisResumeInformation.datePublicationUtc, contract.avisResumeInformation.dateLimiteReceptionOffresUtc, contract.avisResumeInformation.dateLimiteReceptionPlaintesUtc, CAST(NULL AS varchar), contract.avisResumeInformation.dateLimiteReceptionOffresUtc, CAST(NULL AS varchar), contract.avisResumeInformation.dureePrevueSansOptions, contract.avisResumeInformation.dureePrevueIncluantOptions, contract.avisResumeInformation.sommaireOptionsRenouvellement, CAST(contract.avisResumeInformation.contratSurDemande AS varchar), CAST(contract.avisResumeInformation.contratSurDemande AS varchar), contract.avisResumeInformation.stveOption.descriptionFr, contract.avisResumeInformation.adresseRecuperation.descriptionLongueFr, contract.avisResumeInformation.adresseOuverture.descriptionLongueFr, CAST(contract.avisResumeInformation.prevoitAdjudicationParLot AS varchar), contract.avisResumeInformation.restrictionSupplementaire, array_join(transform(contract.avisResumeGarantieSoumission.naturesGaranties, g -> g.descriptionFr), '; '), contract.avisResumeGarantieSoumission.valeurGarantieHtml, contract.avisResumeDescription.nomFournisseur, CASE WHEN cardinality(contract.avisResumeInformationDO.contacts) > 0 THEN concat(coalesce(contract.avisResumeInformationDO.contacts[1].prenom, ''), ' ', coalesce(contract.avisResumeInformationDO.contacts[1].nom, '')) ELSE NULL END, CASE WHEN cardinality(contract.avisResumeInformationDO.contacts) > 0 THEN contract.avisResumeInformationDO.contacts[1].courriel ELSE NULL END, CASE WHEN cardinality(contract.avisResumeInformationDO.contacts) > 0 THEN contract.avisResumeInformationDO.contacts[1].telephone ELSE NULL END, dt FROM seao.raw src WHERE src.dt = '\" & $processDate & \"' AND NOT EXISTS (SELECT 1 FROM seao.contracts c WHERE c.numero_reference = CAST(src.contract.avisResumeInformation.id AS varchar))\" %}",
+        "WorkGroup": "primary",
+        "QueryExecutionContext": {
+          "Database": "seao"
+        },
+        "ResultConfiguration": {
+          "OutputLocation": "s3://seao-athena-results/queries/"
+        }
+      },
+      "End": true
+    }
+  }
+}
